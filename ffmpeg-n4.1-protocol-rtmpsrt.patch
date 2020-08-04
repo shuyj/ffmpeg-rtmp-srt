@@ -1,0 +1,112 @@
+diff --git a/libavformat/protocols.c b/libavformat/protocols.c
+index ad95659795e4fc43c9e1bbf91348c7fcc3bd505e..cdf6e15fa0763a8b7ad2db9015df512a4ba78f0b 100644
+--- a/libavformat/protocols.c
++++ b/libavformat/protocols.c
+@@ -50,6 +50,7 @@ extern const URLProtocol ff_rtmps_protocol;
+ extern const URLProtocol ff_rtmpt_protocol;
+ extern const URLProtocol ff_rtmpte_protocol;
+ extern const URLProtocol ff_rtmpts_protocol;
++extern const URLProtocol ff_rtmpsrt_protocol;
+ extern const URLProtocol ff_rtp_protocol;
+ extern const URLProtocol ff_sctp_protocol;
+ extern const URLProtocol ff_srtp_protocol;
+diff --git a/libavformat/rtmpproto.c b/libavformat/rtmpproto.c
+index b741e421af972a66bf424c730f3992549962eb05..d3bedda013ead1ce6a21a9a2be65a2e78a54d731 100644
+--- a/libavformat/rtmpproto.c
++++ b/libavformat/rtmpproto.c
+@@ -2636,6 +2636,16 @@ static int rtmp_open(URLContext *s, const char *uri, int flags, AVDictionary **o
+ 
+         /* open the http tunneling connection */
+         ff_url_join(buf, sizeof(buf), "ffrtmphttp", NULL, hostname, port, NULL);
++    } else if (!strcmp(proto, "rtmpsrt")){
++        if (port < 0)
++            port = 8081;
++        if (s->rw_timeout > 0){
++            av_dict_set_int(opts, "connect_timeout", s->rw_timeout*1000, 1);
++            ff_url_join(buf, sizeof(buf), "srt", NULL, hostname, port, "?streamid=%s&timeout=%d", path, s->rw_timeout*1000000);
++        }else{
++            ff_url_join(buf, sizeof(buf), "srt", NULL, hostname, port, "?streamid=%s", path);
++        }
++        av_dict_set(opts, "transtype", "file", 1);
+     } else if (!strcmp(proto, "rtmps")) {
+         /* open the tls connection */
+         if (port < 0)
+@@ -3087,6 +3097,25 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
+     return size;
+ }
+ 
++static int rtmp_get_file_handle(URLContext *s){
++    RTMPContext *rt = s->priv_data;
++    char proto[8], hostname[256], path[1024], auth[100], *fname;
++    char *old_app, *qmark, *n, fname_buffer[1024];
++    uint8_t buf[2048];
++    int port;
++    int ret;
++
++    av_url_split(proto, sizeof(proto), auth, sizeof(auth),
++                 hostname, sizeof(hostname), &port,
++                 path, sizeof(path), s->filename);
++
++    
++    if (!strcmp(proto, "rtmpsrt")){
++        return ffurl_get_file_handle(rt->stream);
++    }
++    return -1;
++}
++
+ #define OFFSET(x) offsetof(RTMPContext, x)
+ #define DEC AV_OPT_FLAG_DECODING_PARAM
+ #define ENC AV_OPT_FLAG_ENCODING_PARAM
+@@ -3131,6 +3160,7 @@ const URLProtocol ff_##flavor##_protocol = {     \
+     .url_read_pause = rtmp_pause,                \
+     .url_write      = rtmp_write,                \
+     .url_close      = rtmp_close,                \
++    .url_get_file_handle = rtmp_get_file_handle, \
+     .priv_data_size = sizeof(RTMPContext),       \
+     .flags          = URL_PROTOCOL_FLAG_NETWORK, \
+     .priv_data_class= &flavor##_class,           \
+@@ -3143,3 +3173,4 @@ RTMP_PROTOCOL(rtmps)
+ RTMP_PROTOCOL(rtmpt)
+ RTMP_PROTOCOL(rtmpte)
+ RTMP_PROTOCOL(rtmpts)
++RTMP_PROTOCOL(rtmpsrt)
+diff --git a/libavformat/libsrt.c b/libavformat/libsrt.c
+index fe3b3121515634df11924c8266022eabccce201a..4e217c10bedfb4d9ba629bc11342bbe12c300574 100644
+--- a/libavformat/libsrt.c
++++ b/libavformat/libsrt.c
+@@ -134,14 +134,15 @@ static const AVOption libsrt_options[] = {
+ static int libsrt_neterrno(URLContext *h)
+ {
+     int err = srt_getlasterror(NULL);
+-    av_log(h, AV_LOG_ERROR, "%s\n", srt_getlasterror_str());
+-    if (err == SRT_EASYNCRCV)
++    if (err == SRT_EASYNCRCV || err == SRT_ENOSERVER)
+         return AVERROR(EAGAIN);
++    av_log(h, AV_LOG_ERROR, "%s\n", srt_getlasterror_str());
+     return AVERROR_UNKNOWN;
+ }
+ 
+ static int libsrt_socket_nonblock(int socket, int enable)
+ {
++    enable = !enable;
+     int ret = srt_setsockopt(socket, 0, SRTO_SNDSYN, &enable, sizeof(enable));
+     if (ret < 0)
+         return ret;
+@@ -429,13 +430,16 @@ static int libsrt_setup(URLContext *h, const char *uri, int flags)
+         }
+ 
+         if ((ret = libsrt_listen_connect(s->eid, fd, cur_ai->ai_addr, cur_ai->ai_addrlen,
+-                                          open_timeout / 1000, h, !!cur_ai->ai_next)) < 0) {
++                                          open_timeout, h, !!cur_ai->ai_next)) < 0) {
+             if (ret == AVERROR_EXIT)
+                 goto fail1;
+             else
+                 goto fail;
+         }
+     }
++
++    av_log(h, AV_LOG_WARNING,"Success to connect hostname=%s ret=%d, sock=%d", hostname, ret, fd);
++
+     if ((ret = libsrt_set_options_post(h, fd)) < 0) {
+         goto fail;
+     }
